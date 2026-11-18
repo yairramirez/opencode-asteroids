@@ -119,6 +119,9 @@ class Asteroid {
 }
 
 // ── Ship ──────────────────────────────────────────────────────────────────────
+const BOOST_FACTOR   = 2;   // thrust multiplier while turbo is active
+const BOOST_DURATION = 5;   // seconds of turbo per pickup
+
 class Ship {
   constructor() { this.reset(); }
 
@@ -132,6 +135,7 @@ class Ship {
     this.thrusting     = false;
     this.invincible    = 3;
     this.shootCooldown = 0;
+    this.boostTime     = 0;
     this.dead          = false;
   }
 
@@ -139,18 +143,23 @@ class Ship {
     if (this.dead) return;
     if (this.invincible    > 0) this.invincible    -= dt;
     if (this.shootCooldown > 0) this.shootCooldown -= dt;
+    if (this.boostTime     > 0) this.boostTime     -= dt;
 
-    const ROT   = 3.5;   // rad/s
-    const THRUST = 260;  // px/s²
+    const ROT    = 3.5;   // rad/s
+    const THRUST = 260;   // px/s²
     const DRAG   = 0.987;
+
+    // Boost scales acceleration only. With this drag model terminal velocity is
+    // proportional to thrust, so top speed doubles and nothing snaps on expiry.
+    const thrust = THRUST * (this.boostTime > 0 ? BOOST_FACTOR : 1);
 
     if (keys['ArrowLeft'])  this.angle -= ROT * dt;
     if (keys['ArrowRight']) this.angle += ROT * dt;
 
     this.thrusting = !!keys['ArrowUp'];
     if (this.thrusting) {
-      this.vx += Math.cos(this.angle) * THRUST * dt;
-      this.vy += Math.sin(this.angle) * THRUST * dt;
+      this.vx += Math.cos(this.angle) * thrust * dt;
+      this.vy += Math.sin(this.angle) * thrust * dt;
     }
 
     this.vx *= DRAG;
@@ -189,13 +198,16 @@ class Ship {
     ctx.closePath();
     ctx.stroke();
 
-    // Llama del propulsor
+    // Thruster flame — longer and cyan while boosting
     if (this.thrusting && Math.random() > 0.35) {
+      const boosted = this.boostTime > 0;
       ctx.beginPath();
       ctx.moveTo(-8, -4);
-      ctx.lineTo(-8 - rand(6, 14), 0);
+      ctx.lineTo(-8 - rand(6, 14) * (boosted ? 2 : 1), 0);
       ctx.lineTo(-8,  4);
-      ctx.strokeStyle = 'rgba(255, 130, 0, 0.85)';
+      ctx.strokeStyle = boosted
+        ? 'rgba(0, 230, 255, 0.9)'
+        : 'rgba(255, 130, 0, 0.85)';
       ctx.stroke();
     }
 
@@ -235,8 +247,64 @@ class Particle {
   }
 }
 
+// ── PowerUp (turbo) ───────────────────────────────────────────────────────────
+const PICKUP_TTL  = 10;    // seconds before an uncollected pickup vanishes
+const DROP_CHANCE = 0.15;  // chance an asteroid drops a pickup when destroyed
+
+class PowerUp {
+  constructor(x, y) {
+    this.x = x;
+    this.y = y;
+    const angle = rand(0, Math.PI * 2);
+    const speed = rand(15, 30);
+    this.vx = Math.cos(angle) * speed;
+    this.vy = Math.sin(angle) * speed;
+    this.radius = 11;
+    this.phase  = rand(0, Math.PI * 2);
+    this.ttl    = PICKUP_TTL;
+    this.dead   = false;
+  }
+
+  update(dt) {
+    this.x = wrap(this.x + this.vx * dt, W);
+    this.y = wrap(this.y + this.vy * dt, H);
+    this.phase += dt * 6;
+    this.ttl -= dt;
+    if (this.ttl <= 0) this.dead = true;
+  }
+
+  draw() {
+    // Blink during the last two seconds so a missed pickup warns before it goes
+    if (this.ttl < 2 && Math.floor(this.ttl * 8) % 2 === 0) return;
+
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth   = 1.5;
+    ctx.lineJoin    = 'round';
+
+    // Pulsing ring
+    ctx.beginPath();
+    ctx.arc(0, 0, this.radius + Math.sin(this.phase) * 1.5, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Lightning bolt, kept upright so it reads as a symbol
+    ctx.beginPath();
+    ctx.moveTo( 4, -8);
+    ctx.lineTo(-3,  1);
+    ctx.lineTo( 1,  1);
+    ctx.lineTo(-4,  8);
+    ctx.lineTo( 3, -1);
+    ctx.lineTo(-1, -1);
+    ctx.closePath();
+    ctx.stroke();
+
+    ctx.restore();
+  }
+}
+
 // ── Estado del juego ──────────────────────────────────────────────────────────
-let ship, bullets, asteroids, particles;
+let ship, bullets, asteroids, particles, pickups;
 let score, lives, level;
 let state;      // 'playing' | 'dead' | 'gameover'
 let deadTimer;
@@ -258,6 +326,7 @@ function initGame() {
   bullets   = [];
   asteroids = [];
   particles = [];
+  pickups   = [];
   score  = 0;
   lives  = 3;
   level  = 1;
@@ -269,6 +338,7 @@ function nextLevel() {
   level++;
   bullets   = [];
   particles = [];
+  pickups   = [];
   ship.reset();
   spawnAsteroids(3 + level);
 }
@@ -280,6 +350,9 @@ function explode(x, y, count = 8) {
 function killShip() {
   explode(ship.x, ship.y, 14);
   ship.dead = true;
+  // Clear the boost now: reset() only runs two seconds later on respawn, and
+  // the HUD keeps reading boostTime through the death pause.
+  ship.boostTime = 0;
   lives--;
   if (lives <= 0) {
     state = 'gameover';
@@ -303,6 +376,9 @@ function update(dt) {
     particles.forEach(p => p.update(dt));
     particles = particles.filter(p => !p.dead);
     asteroids.forEach(a => a.update(dt));
+    // Pickups keep drifting and aging while the ship respawns
+    pickups.forEach(p => p.update(dt));
+    pickups = pickups.filter(p => !p.dead);
     if (deadTimer <= 0) { state = 'playing'; ship.reset(); }
     return;
   }
@@ -316,9 +392,11 @@ function update(dt) {
   bullets.forEach(b => b.update(dt));
   asteroids.forEach(a => a.update(dt));
   particles.forEach(p => p.update(dt));
+  pickups.forEach(p => p.update(dt));
 
   bullets   = bullets.filter(b => !b.dead);
   particles = particles.filter(p => !p.dead);
+  pickups   = pickups.filter(p => !p.dead);
 
   // Bala vs asteroide
   const newAsteroids = [];
@@ -328,6 +406,7 @@ function update(dt) {
         b.dead = true;
         a.dead = true;
         score += POINTS[a.size];
+        if (Math.random() < DROP_CHANCE) pickups.push(new PowerUp(a.x, a.y));
         explode(a.x, a.y, a.size * 5);
         newAsteroids.push(...a.split());
       }
@@ -335,6 +414,15 @@ function update(dt) {
   }
   asteroids = asteroids.filter(a => !a.dead).concat(newAsteroids);
   bullets   = bullets.filter(b => !b.dead);
+
+  // Nave vs power-up — refreshes the timer, never stacks
+  for (const p of pickups) {
+    if (!p.dead && dist(ship, p) < ship.radius + p.radius) {
+      p.dead = true;
+      ship.boostTime = BOOST_DURATION;
+    }
+  }
+  pickups = pickups.filter(p => !p.dead);
 
   // Nave vs asteroide
   if (ship.invincible <= 0) {
@@ -375,6 +463,9 @@ function drawHUD() {
   ctx.textAlign = 'left';
   ctx.fillText(`SCORE  ${score}`, 14, 26);
 
+  if (ship.boostTime > 0)
+    ctx.fillText(`TURBO  ${Math.max(0, ship.boostTime).toFixed(1)}s`, 14, 46);
+
   ctx.textAlign = 'center';
   ctx.fillText(`NIVEL ${level}`, W / 2, 26);
 
@@ -398,6 +489,7 @@ function draw() {
   ctx.fillRect(0, 0, W, H);
 
   particles.forEach(p => p.draw());
+  pickups.forEach(p => p.draw());
   asteroids.forEach(a => a.draw());
   bullets.forEach(b => b.draw());
   ship.draw();
